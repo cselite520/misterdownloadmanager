@@ -260,17 +260,41 @@ pub fn private_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
         .atomic_write(path, bytes)
 }
 
+// Resolving the portable directory touches the disk: it checks
+// whether a `data` folder next to the executable is a directory
+// (`is_dir`), and when such a folder exists it also writes an empty
+// `.write-test` file into it and then removes that file, to prove
+// the folder can be written. `portable_dir()` used to run that
+// probe on every call, including once every 2s from
+// `App::torrent_tick()` on the UI thread, reached through
+// `torrents::state_dir()` -> `data_dir()`. On a slow or busy disk
+// that disk probe could therefore freeze the window for about 8s
+// and trip the freeze watchdog, which reported the stall as a
+// freeze in `mdm_ipc::portable_dir`. On a healthy disk the probe is
+// quick, but there is no reason to repeat it: the answer cannot
+// change unless the executable itself moves, which cannot happen
+// for a running process. The executable's location and the
+// presence of a `data` folder next to it do not change while the
+// app runs, so resolving the probe once and keeping the result for
+// the rest of the run is safe. This cache only covers the
+// portable-directory probe: `data_dir()` still honours `--data`
+// and `MDM_DATA_DIR` on every call, and only falls back to the
+// cached portable directory after those checks.
+static PORTABLE_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
 /// Portable mode: the `data` folder next to the program, when it exists and can be written
 /// (else the profile folder is used). Nothing is written to the registry in this mode.
 pub fn portable_dir() -> Option<PathBuf> {
-    let dir = std::env::current_exe().ok()?.parent()?.join("data");
-    if !dir.is_dir() {
-        return None;
-    }
-    let probe = dir.join(".write-test");
-    let writable = std::fs::write(&probe, b"").is_ok();
-    let _ = std::fs::remove_file(&probe);
-    writable.then_some(dir)
+    PORTABLE_DIR.get_or_init(|| {
+        let dir = std::env::current_exe().ok()?.parent()?.join("data");
+        if !dir.is_dir() {
+            return None;
+        }
+        let probe = dir.join(".write-test");
+        let writable = std::fs::write(&probe, b"").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        writable.then_some(dir)
+    }).clone()
 }
 
 /// Become the one running instance: an OS lock on `instance.lock` in the data folder, held for
@@ -772,5 +796,11 @@ mod tests {
     fn tokens_are_random() {
         assert_ne!(random_token(), random_token());
         assert_eq!(random_token().len(), 64);
+    }
+
+    #[test]
+    fn portable_dir_is_resolved_once() {
+        assert_eq!(portable_dir(), portable_dir());
+        assert_eq!(data_dir(), data_dir());
     }
 }
